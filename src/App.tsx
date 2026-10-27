@@ -16,6 +16,7 @@ import {
   Download,
 } from 'lucide-react';
 import { TrackData, RemasterMode, DownloadHistoryItem } from './types';
+import { fetchJson } from './utils/api';
 import { WaveformPlayer } from './components/WaveformPlayer';
 import { BatchDownloader } from './components/BatchDownloader';
 import { DownloadHistory } from './components/DownloadHistory';
@@ -90,16 +91,11 @@ export default function App() {
     setErrorMessage(null);
 
     try {
-      const res = await fetch('/api/extract', {
+      const data = await fetchJson('/api/extract', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: trimmed }),
       });
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Không thể trích xuất bài hát từ URL này.');
-      }
 
       setCurrentTrack(data);
       setTrimRange([0, data.duration || 140]);

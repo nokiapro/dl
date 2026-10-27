@@ -10,6 +10,7 @@ import {
   Layers
 } from 'lucide-react';
 import { TrackData } from '../types';
+import { fetchJson } from '../utils/api';
 import {
   downloadBlob,
   fetchAudioBuffer,
@@ -61,15 +62,12 @@ export const BatchDownloader: React.FC<BatchDownloaderProps> = ({ onSelectTrack 
       const url = urls[i];
       setStatusMessage(`Đang phân tích (${i + 1}/${urls.length}): ${url.slice(0, 40)}...`);
       try {
-        const res = await fetch('/api/extract', {
+        const data = await fetchJson<TrackData>('/api/extract', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url }),
         });
-        if (res.ok) {
-          const data = await res.json();
-          results.push(data);
-        }
+        results.push(data);
       } catch (e) {
         console.error('Batch extract failed for', url, e);
       }

@@ -28,6 +28,35 @@ const PORT = process.env.PORT && process.env.PORT !== '8080' ? Number(process.en
 
 app.use(express.json());
 
+// fetch with a hard timeout (covers headers + body) so a slow upstream can never hang a request forever
+function fetchWithTimeout(input: string | URL, init: RequestInit = {}, ms = 12000): Promise<Response> {
+  return fetch(input, { ...init, signal: init.signal ?? AbortSignal.timeout(ms) });
+}
+
+// Guarantees /api/extract ALWAYS answers with a non-empty JSON body:
+//  - never sends an empty body (res.json(undefined) would cause "Unexpected end of JSON input" on the client)
+//  - answers 504 JSON if processing takes too long (instead of letting a proxy cut the connection with an empty reply)
+//  - ignores late writes after the deadline (no "headers already sent" crashes)
+const EXTRACT_DEADLINE_MS = 25000;
+app.use('/api/extract', (req, res, next) => {
+  const originalJson = res.json.bind(res);
+  res.json = ((body?: any) => {
+    if (res.headersSent) return res;
+    return originalJson(body === undefined ? {} : body);
+  }) as typeof res.json;
+
+  const timer = setTimeout(() => {
+    if (!res.headersSent) {
+      res.status(504).json({
+        error: 'Máy chủ phản hồi quá lâu khi phân tích liên kết này. Vui lòng thử lại hoặc dùng liên kết khác.',
+      });
+    }
+  }, EXTRACT_DEADLINE_MS);
+  res.on('finish', () => clearTimeout(timer));
+  res.on('close', () => clearTimeout(timer));
+  next();
+});
+
 export type PlatformSource =
   | 'musiccreator.ai'
   | 'freemusic.ai'
@@ -407,7 +436,7 @@ async function decryptSunoClip(clipId: string): Promise<string | null> {
   const promise = (async (): Promise<string | null> => {
     try {
     // 1. Request anonymous license rights from Suno
-    const rightsRes = await fetch('https://studio-api-prod.suno.com/api/mango/rights', {
+    const rightsRes = await fetchWithTimeout('https://studio-api-prod.suno.com/api/mango/rights', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -459,12 +488,12 @@ async function decryptSunoClip(clipId: string): Promise<string | null> {
     let encBuf: Uint8Array | null = null;
     for (const u of candidateUrls) {
       try {
-        const encRes = await fetch(u, {
+        const encRes = await fetchWithTimeout(u, {
           headers: {
             'User-Agent':
               'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
           },
-        });
+        }, 60000);
         if (encRes.ok) {
           encBuf = new Uint8Array(await encRes.arrayBuffer());
           break;
@@ -562,7 +591,7 @@ async function extractSunoTrack(rawUrl: string): Promise<TrackMetadata | null> {
   // 1. Direct Suno Studio Clip API for authoritative song data
   try {
     const clipApiUrl = `https://studio-api.prod.suno.com/api/clip/${songId}`;
-    const clipRes = await fetch(clipApiUrl, {
+    const clipRes = await fetchWithTimeout(clipApiUrl, {
       headers: {
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -604,7 +633,7 @@ async function extractSunoTrack(rawUrl: string): Promise<TrackMetadata | null> {
   if (!pageOk || title.startsWith('Suno AI Track')) {
     const targetPageUrl = rawUrl.startsWith('http') ? rawUrl : `https://suno.com/song/${songId}`;
     try {
-      const pageRes = await fetch(targetPageUrl, {
+      const pageRes = await fetchWithTimeout(targetPageUrl, {
         headers: {
           'User-Agent':
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -744,7 +773,7 @@ async function extractOpenMusicTrack(rawUrl: string): Promise<TrackMetadata | nu
   } else {
     // 2. Fetch the OpenMusic page
     try {
-      const pageRes = await fetch(rawUrl, {
+      const pageRes = await fetchWithTimeout(rawUrl, {
         headers: {
           'User-Agent':
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -1875,6 +1904,12 @@ process.on('uncaughtException', (err) => {
 async function startServer() {
   const isProd = process.env.NODE_ENV === 'production';
 
+  // Unknown /api routes must answer with JSON, never an empty/HTML body
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'API không tồn tại.' });
+  });
+
+
   if (!isProd) {
     const vite = await createViteServer({
       server: {
@@ -1899,6 +1934,18 @@ async function startServer() {
       }
     });
   }
+
+  // Last-resort error handler: /api requests always get a JSON error (e.g. malformed request body)
+  app.use((err: any, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    console.warn('Express error handler:', err?.message || err);
+    if (res.headersSent) return;
+    const status = Number(err?.status || err?.statusCode) || 500;
+    if (req.path.startsWith('/api')) {
+      res.status(status).json({ error: status === 400 ? 'Dữ liệu gửi lên không hợp lệ.' : 'Lỗi máy chủ nội bộ.' });
+    } else {
+      res.status(status).send('Internal Server Error');
+    }
+  });
 
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`🎵 AI Music Downloader running at http://0.0.0.0:${PORT} [mode: ${isProd ? 'production' : 'development'}]`);
